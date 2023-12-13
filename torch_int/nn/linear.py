@@ -5,6 +5,7 @@ from .._CUDA import (
     linear_a8_w8_b8_o8,
     linear_a8_w8_b32_o32_with_scaling,
     linear_a8_w8_bfp32_ofp32,
+    int8Matmul,
 )
 from ..functional.quantization import (
     quantize_per_tensor_absmax,
@@ -12,6 +13,8 @@ from ..functional.quantization import (
     fake_quantize_activation_per_tensor_absmax,
     fake_quantize_activation_per_token_absmax,
 )
+import transformers
+import torch.nn.functional as F
 
 
 class W8A8B8O8Linear(torch.nn.Module):
@@ -59,8 +62,9 @@ class W8A8B8O8Linear(torch.nn.Module):
         int8_bias, bias_scale = quantize_per_tensor_absmax(module.bias)
         alpha = input_scale * weight_scale / output_scale
         beta = bias_scale / output_scale
-        int8_module.weight = int8_weight
-        int8_module.bias = int8_bias
+        # in case size mismatch
+        int8_module.weight = torch.reshape(int8_weight, int8_module.weight.shape)
+        int8_module.bias = torch.reshape(int8_bias, int8_module.bias.shape)
         int8_module.a = alpha
         int8_module.b = beta
         return int8_module
@@ -114,8 +118,9 @@ class W8A8B8O8LinearReLU(torch.nn.Module):
         int8_bias, bias_scale = quantize_per_tensor_absmax(module.bias)
         alpha = input_scale * weight_scale / output_scale
         beta = bias_scale / output_scale
-        int8_module.weight = int8_weight
-        int8_module.bias = int8_bias
+        # in case size mismatch
+        int8_module.weight = torch.reshape(int8_weight, int8_module.weight.shape)
+        int8_module.bias = torch.reshape(int8_bias, int8_module.bias.shape)
         int8_module.a = alpha
         int8_module.b = beta
         return int8_module
@@ -270,8 +275,11 @@ class W8A8BFP32OFP32Linear(torch.nn.Module):
         int8_module = W8A8BFP32OFP32Linear(module.in_features, module.out_features)
         int8_weight, weight_scale = quantize_per_tensor_absmax(module.weight)
         alpha = input_scale * weight_scale
-        int8_module.weight = int8_weight
-        int8_module.bias = module.bias.to(torch.float32)
+        # in case size mismatch
+        int8_module.weight = torch.reshape(int8_weight, int8_module.weight.shape)
+        int8_module.bias = torch.reshape(
+            module.bias.to(torch.float32), int8_module.bias.shape
+        )
         int8_module.a = alpha
         int8_module.input_scale = input_scale
         int8_module.weight_scale = weight_scale
@@ -563,4 +571,257 @@ class W8A8B8O32LinearWithoutScaling(torch.nn.Module):
         int8_module.bias = int8_bias
         int8_module.a = alpha
         int8_module.b = beta
+        return int8_module
+
+
+"""
+Linear related interfaces
+"""
+
+
+# For QKV, PROJ and FC2.
+# no de-quantization is performed here
+class W8A8BFP16FP16Linear(torch.nn.Module):
+    def __init__(self, in_features, out_features, alpha=1.0, beta=1.0):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        self.register_buffer(
+            "weight",
+            torch.randint(
+                -127,
+                127,
+                (self.out_features, self.in_features),
+                dtype=torch.int8,
+                requires_grad=False,
+            ),
+        )
+        self.register_buffer(
+            "bias",
+            torch.zeros(
+                (1, self.out_features), dtype=torch.float16, requires_grad=False
+            ),
+        )
+        self.register_buffer("a", torch.tensor(alpha))
+        # self.register_buffer("b", torch.tensor(beta))
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.weight = self.weight.to(*args, **kwargs)
+        self.bias = self.bias.to(*args, **kwargs)
+        return self
+
+    @torch.no_grad()
+    def forward(self, x):
+        x_shape = x.shape
+        x = x.view(-1, x_shape[-1])
+        y = int8Matmul(x, self.weight) * self.a.item() + self.bias
+        y = y.view(*x_shape[:-1], -1)
+        return y
+
+    @staticmethod
+    def from_float(module: torch.nn.Linear, input_scale):
+        int8_module = W8A8BFP16FP16Linear(module.in_features, module.out_features)
+        int8_weight, weight_scale = quantize_per_tensor_absmax(module.weight)
+        # int8_bias, bias_scale = quantize_per_tensor_absmax(module.bias)
+        alpha = input_scale * weight_scale
+        # beta = bias_scale / output_scale
+        # in case size mismatch
+        int8_module.weight = torch.reshape(int8_weight, int8_module.weight.shape)
+        int8_module.bias = torch.reshape(module.bias, int8_module.bias.shape)
+        int8_module.a = alpha
+        # int8_module.b = beta
+        return int8_module
+
+
+# For FC1. The input to FC2 should be int8
+# requires runtime quantization, but does not require compute the max
+class W8A8B8O32Linear(torch.nn.Module):
+    def __init__(self, in_features, out_features, alpha=1.0, beta=1.0):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        self.register_buffer(
+            "weight",
+            torch.randint(
+                -127,
+                127,
+                (self.out_features, self.in_features),
+                dtype=torch.int8,
+                requires_grad=False,
+            ),
+        )
+        self.register_buffer(
+            "bias",
+            torch.zeros(
+                (1, self.out_features), dtype=torch.float16, requires_grad=False
+            ),
+        )
+        self.register_buffer("a", torch.tensor(alpha))
+        # self.register_buffer("b", torch.tensor(beta))
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.weight = self.weight.to(*args, **kwargs)
+        self.bias = self.bias.to(*args, **kwargs)
+        return self
+
+    @torch.no_grad()
+    def forward(self, x):
+        x_shape = x.shape
+        x = x.view(-1, x_shape[-1])
+        # (int32)y = x * self.weight
+        y = int8Matmul(x, self.weight)
+        fp_y = y * self.a.item() + self.bias
+        y = fp_y.round().clamp(-128, 127).to(torch.int8)
+        # y = linear_a8_w8_b8_o8(x, self.weight, self.bias, self.a.item(), self.b.item())
+        y = y.view(*x_shape[:-1], -1)
+        return y
+
+    @staticmethod
+    def from_float(module: torch.nn.Linear, input_scale, output_scale):
+        int8_module = W8A8B8O32Linear(module.in_features, module.out_features)
+        int8_weight, weight_scale = quantize_per_tensor_absmax(module.weight)
+        # int8_bias, bias_scale = quantize_per_tensor_absmax(module.bias)
+        fp_bias = module.bias / output_scale
+        alpha = input_scale * weight_scale / output_scale
+        # beta = bias_scale / output_scale
+        # in case size mismatch
+        int8_module.weight = torch.reshape(int8_weight, int8_module.weight.shape)
+        int8_module.bias = torch.reshape(fp_bias, int8_module.bias.shape)
+        int8_module.a = alpha
+        # int8_module.b = beta
+        return int8_module
+
+
+"""
+Conv1D related interfaces
+This is for GPT2 only
+"""
+
+
+# For QKV, PROJ and FC2.
+# no de-quantization is performed here
+class W8A8BFP16FP16Conv1D(torch.nn.Module):
+    def __init__(self, out_features, in_features, alpha=1.0, beta=1.0):
+        super().__init__()
+        self.out_features = out_features
+        self.in_features = in_features
+
+        self.register_buffer(
+            "weight",
+            torch.randint(
+                -127,
+                127,
+                (self.in_features, self.out_features),
+                dtype=torch.int8,
+                requires_grad=False,
+            ),
+        )
+        self.register_buffer(
+            "bias",
+            torch.zeros(
+                (1, self.out_features), dtype=torch.float16, requires_grad=False
+            ),
+        )
+        self.register_buffer("a", torch.tensor(alpha))
+        # self.register_buffer("b", torch.tensor(beta))
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.weight = self.weight.to(*args, **kwargs)
+        self.bias = self.bias.to(*args, **kwargs)
+        return self
+
+    @torch.no_grad()
+    def forward(self, x):
+        x_shape = x.shape
+        x = x.view(-1, x_shape[-1])
+        # y = int8Matmul(x, self.weight.t()) * self.a.item() + self.bias
+        y = F.linear(x.float(), self.weight.t().float()) * self.a.item() + self.bias
+        y = y.view(*x_shape[:-1], -1)
+        return y
+
+    @staticmethod
+    def from_float(
+        module: transformers.pytorch_utils.Conv1D,
+        out_features,
+        in_features,
+        input_scale,
+    ):
+        int8_module = W8A8BFP16FP16Conv1D(out_features, in_features)
+        int8_weight, weight_scale = quantize_per_tensor_absmax(module.weight)
+        # int8_bias, bias_scale = quantize_per_tensor_absmax(module.bias)
+        alpha = input_scale * weight_scale
+        # beta = bias_scale / output_scale
+        # in case size mismatch
+        int8_module.weight = torch.reshape(int8_weight, int8_module.weight.shape)
+        int8_module.bias = torch.reshape(module.bias, int8_module.bias.shape)
+        int8_module.a = alpha
+        # int8_module.b = beta
+        return int8_module
+
+
+# For FC1. The input to FC2 should be int8
+# requires runtime quantization, but does not require compute the max
+class W8A8B8O32Conv1D(torch.nn.Module):
+    def __init__(self, out_features, in_features, alpha=1.0, beta=1.0):
+        super().__init__()
+        self.out_features = out_features
+        self.in_features = in_features
+
+        self.register_buffer(
+            "weight",
+            torch.randint(
+                -127,
+                127,
+                (self.in_features, self.out_features),
+                dtype=torch.int8,
+                requires_grad=False,
+            ),
+        )
+        self.register_buffer(
+            "bias",
+            torch.zeros(
+                (1, self.out_features), dtype=torch.float16, requires_grad=False
+            ),
+        )
+        self.register_buffer("a", torch.tensor(alpha))
+        # self.register_buffer("b", torch.tensor(beta))
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.weight = self.weight.to(*args, **kwargs)
+        self.bias = self.bias.to(*args, **kwargs)
+        return self
+
+    @torch.no_grad()
+    def forward(self, x):
+        x_shape = x.shape
+        x = x.view(-1, x_shape[-1])
+        # (int32)y = x * self.weight
+        y = int8Matmul(x, self.weight.t())
+        fp_y = y * self.a.item() + self.bias
+        y = fp_y.round().clamp(-128, 127).to(torch.int8)
+        # y = linear_a8_w8_b8_o8(x, self.weight, self.bias, self.a.item(), self.b.item())
+        y = y.view(*x_shape[:-1], -1)
+        return y
+
+    @staticmethod
+    def from_float(
+        module: transformers.pytorch_utils.Conv1D, input_scale, output_scale
+    ):
+        int8_module = W8A8B8O32Conv1D(module.in_features, module.out_features)
+        int8_weight, weight_scale = quantize_per_tensor_absmax(module.weight.t())
+        # int8_bias, bias_scale = quantize_per_tensor_absmax(module.bias)
+        fp_bias = module.bias / output_scale
+        alpha = input_scale * weight_scale / output_scale
+        # beta = bias_scale / output_scale
+        # in case size mismatch
+        int8_module.weight = torch.reshape(int8_weight.t(), int8_module.weight.shape)
+        int8_module.bias = torch.reshape(fp_bias, int8_module.bias.shape)
+        int8_module.a = alpha
+        # int8_module.b = beta
         return int8_module

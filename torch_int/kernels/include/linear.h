@@ -40,4 +40,8 @@ torch::Tensor linear_a8_w8_b8_o8(torch::Tensor input,  // INT8
                                  float beta            // FP32
 );
 
+torch::Tensor int8Matmul(torch::Tensor &A, // INT8
+                         torch::Tensor &B  // INT8
+);
+
 #endif // LINEAR_HS
