@@ -12,15 +12,16 @@ from ..functional.quantization import (
     quantize_weight_per_channel_absmax,
     fake_quantize_activation_per_tensor_absmax,
     fake_quantize_activation_per_token_absmax,
+    quantize_per_tensor_absmax_custom_bits,
 )
 import transformers
 import torch.nn.functional as F
 import time
 
-LOG = True
+LOG = False
 QUAN = False
-B = 4
-SEQ = 512
+B = 1
+SEQ = 8
 DIM = 1024
 zeros_f1 = torch.zeros((B * SEQ, DIM), device="cpu")
 zeros_f13 = torch.zeros((B * SEQ, DIM * 3), device="cpu")
@@ -602,6 +603,130 @@ Linear related interfaces
 """
 
 
+class WqAqBFP16FP16Linear(torch.nn.Module):
+    def __init__(self, in_features, out_features, alpha=1.0, beta=1.0):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        self.register_buffer(
+            "weight",
+            torch.randint(
+                -127,
+                127,
+                (self.out_features, self.in_features),
+                dtype=torch.int8,
+                requires_grad=False,
+            ),
+        )
+        self.register_buffer(
+            "bias",
+            torch.zeros(
+                (1, self.out_features), dtype=torch.float16, requires_grad=False
+            ),
+        )
+        self.register_buffer("a", torch.tensor(alpha))
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.weight = self.weight.to(*args, **kwargs)
+        if self.bias is not None:
+            self.bias = self.bias.to(*args, **kwargs)
+        return self
+
+    @torch.no_grad()
+    def forward(self, x, is_hybrid=True):
+        x_shape = x.shape
+        x = x.view(-1, x_shape[-1])
+        if is_hybrid:
+            # mask
+            x = x.cpu()
+            t1 = time.time()
+            # rand_elements = torch.randint(-128, 127, x.shape, device="cpu").to(x.dtype)
+            rand_elements = torch.zeros(x.shape, device="cpu").to(x.dtype)
+            t2 = time.time()
+            # mask_mul = F.linear(rand_elements.float(), self.weight.cpu().float())
+            mask_mul = torch.zeros(x.shape[0], self.out_features)
+
+            if LOG:
+                print(
+                    f"Offline r time: {(t2 - t1) * 1000} ms, Offline f(r) time: {(t2 - t1) * 1000} ms"
+                )
+
+            # mask
+            t3 = time.time()
+            masked_x = torch.add(
+                x,
+                rand_elements,
+            )
+            if QUAN:
+                # compute wrap
+                wraps = ((masked_x ^ x) & (masked_x ^ rand_elements) & 0x80) >> 7
+                wraps[(wraps < 0) & (masked_x < 0)] = 1
+                wraps = wraps.to(torch.int8)
+                wraps = wraps.cuda()  # check security
+            if LOG:
+                print(f"\033[1;31;40mMask x time: {(time.time() - t3) * 1000} ms\033[m")
+
+            # CPU->GPU IO
+            t4 = time.time()
+            masked_x = masked_x.cuda()
+            if LOG:
+                print(
+                    f"\033[1;31;40mCPU->GPU IO time: {(time.time() - t4) * 1000} ms\033[m"
+                )
+
+            # GPU-side linear computation
+            t5 = time.time()
+            hidden_states = F.linear(masked_x.float(), self.weight.float())
+            if LOG:
+                print(
+                    f"\033[1;31;40mOnline W*x'+b time: {(time.time() - t5) * 1000} ms\033[m"
+                )
+
+            # unmask
+
+            t6 = time.time()
+            if QUAN:
+                # 1. plus w*W*M on GPU
+                overflow_part = (
+                    F.linear(wraps.float(), self.weight.float()).to(torch.int32) << 8
+                )
+                hidden_states = hidden_states + overflow_part
+            # 2. minus wr on CPU
+            t7 = time.time()
+            y = hidden_states.cpu() - mask_mul
+            if self.bias is not None:
+                y = y * self.a.item() + self.bias.cpu()
+            else:
+                y = y * self.a.item()
+            if LOG:
+                print(
+                    f"\033[1;31;40mOnline unmask time: {(time.time() - t7) * 1000} ms\033[m"
+                )
+        else:
+            # x = x.cuda()  # x should be on GPU device
+            y = F.linear(x.float(), self.weight.float()) * self.a.item() + (
+                self.bias if self.bias else 0
+            )
+        y = y.view(*x_shape[:-1], -1)
+        return y
+
+    @staticmethod
+    def from_float(module: torch.nn.Linear, input_scale):
+        int8_module = W8A8BFP16FP16Linear(module.in_features, module.out_features)
+        int8_weight, weight_scale = quantize_per_tensor_absmax(module.weight)
+        alpha = input_scale * weight_scale
+        # in case size mismatch
+        int8_module.weight = torch.reshape(int8_weight, int8_module.weight.shape)
+        try:  # in case some linear layer does not have bias
+            int8_module.bias = torch.reshape(module.bias, int8_module.bias.shape)
+        except:
+            int8_module.bias = None
+        int8_module.a = alpha
+        return int8_module
+
+
 # For QKV, PROJ and FC2.
 # no de-quantization is performed here
 class W8A8BFP16FP16Linear(torch.nn.Module):
@@ -627,21 +752,25 @@ class W8A8BFP16FP16Linear(torch.nn.Module):
             ),
         )
         self.register_buffer("a", torch.tensor(alpha))
-        # self.register_buffer("b", torch.tensor(beta))
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
         self.weight = self.weight.to(*args, **kwargs)
-        self.bias = self.bias.to(*args, **kwargs)
+        if self.bias is not None:
+            self.bias = self.bias.to(*args, **kwargs)
         return self
 
     @torch.no_grad()
-    def forward(self, x, is_hybrid=True):
+    def forward(self, x, is_hybrid=False):
+        """
+        is_hybrid: whether use OTP and GPU to accelerate some part of the linear computations
+        """
         x_shape = x.shape
         x = x.view(-1, x_shape[-1])
         if is_hybrid:
             # mask
             x = x.cpu()
+            print(f"x dtype: {x.dtype}")
             t1 = time.time()
             # rand_elements = torch.randint(-128, 127, x.shape, device="cpu").to(x.dtype)
             rand_elements = torch.zeros(x.shape, device="cpu").to(x.dtype)
@@ -649,9 +778,10 @@ class W8A8BFP16FP16Linear(torch.nn.Module):
             # mask_mul = F.linear(rand_elements.float(), self.weight.cpu().float())
             mask_mul = torch.zeros(x.shape[0], self.out_features)
 
-            print(
-                f"Offline r time: {(t2 - t1) * 1000} ms, Offline f(r) time: {(t2 - t1) * 1000} ms"
-            )
+            if LOG:
+                print(
+                    f"Offline r time: {(t2 - t1) * 1000} ms, Offline f(r) time: {(t2 - t1) * 1000} ms"
+                )
 
             # mask
             t3 = time.time()
@@ -659,44 +789,56 @@ class W8A8BFP16FP16Linear(torch.nn.Module):
                 x,
                 rand_elements,
             )
-            # compute wrap
-            wraps = ((masked_x ^ x) & (masked_x ^ rand_elements) & 0x80) >> 7
-            wraps[(wraps < 0) & (masked_x < 0)] = 1
-            wraps = wraps.to(torch.int8)
-            wraps = wraps.cuda()  # check security
-            print(f"\033[1;31;40mMask x time: {(time.time() - t3) * 1000} ms\033[m")
+            if QUAN:
+                # compute wrap
+                wraps = ((masked_x ^ x) & (masked_x ^ rand_elements) & 0x80) >> 7
+                wraps[(wraps < 0) & (masked_x < 0)] = 1
+                wraps = wraps.to(torch.int8)
+                wraps = wraps.cuda()  # check security
+            if LOG:
+                print(f"\033[1;31;40mMask x time: {(time.time() - t3) * 1000} ms\033[m")
 
             # CPU->GPU IO
             t4 = time.time()
             masked_x = masked_x.cuda()
-            print(
-                f"\033[1;31;40mCPU->GPU IO time: {(time.time() - t4) * 1000} ms\033[m"
-            )
+            if LOG:
+                print(
+                    f"\033[1;31;40mCPU->GPU IO time: {(time.time() - t4) * 1000} ms\033[m"
+                )
 
             # GPU-side linear computation
             t5 = time.time()
             hidden_states = F.linear(masked_x.float(), self.weight.float())
-            print(
-                f"\033[1;31;40mOnline W*x'+b time: {(time.time() - t5) * 1000} ms\033[m"
-            )
+            if LOG:
+                print(
+                    f"\033[1;31;40mOnline W*x'+b time: {(time.time() - t5) * 1000} ms\033[m"
+                )
 
             # unmask
+
             t6 = time.time()
-            # 1. plus w*W*M on GPU
-            overflow_part = (
-                F.linear(wraps.float(), self.weight.float()).to(torch.int32) << 8
-            )
-            hidden_states = hidden_states + overflow_part
+            if QUAN:
+                # 1. plus w*W*M on GPU
+                overflow_part = (
+                    F.linear(wraps.float(), self.weight.float()).to(torch.int32) << 8
+                )
+                hidden_states = hidden_states + overflow_part
             # 2. minus wr on CPU
             t7 = time.time()
             y = hidden_states.cpu() - mask_mul
-            y = y * self.a.item() + self.bias.cpu()
-            print(
-                f"\033[1;31;40mOnline unmask time: {(time.time() - t7) * 1000} ms\033[m"
-            )
+            if self.bias is not None:
+                y = y * self.a.item() + self.bias.cpu()
+            else:
+                y = y * self.a.item()
+            if LOG:
+                print(
+                    f"\033[1;31;40mOnline unmask time: {(time.time() - t7) * 1000} ms\033[m"
+                )
         else:
             # x = x.cuda()  # x should be on GPU device
-            y = F.linear(x.float(), self.weight.float()) * self.a.item() + self.bias
+            y = F.linear(x.float(), self.weight.float()) * self.a.item() + (
+                self.bias if self.bias else 0
+            )
         y = y.view(*x_shape[:-1], -1)
         return y
 
@@ -704,14 +846,14 @@ class W8A8BFP16FP16Linear(torch.nn.Module):
     def from_float(module: torch.nn.Linear, input_scale):
         int8_module = W8A8BFP16FP16Linear(module.in_features, module.out_features)
         int8_weight, weight_scale = quantize_per_tensor_absmax(module.weight)
-        # int8_bias, bias_scale = quantize_per_tensor_absmax(module.bias)
         alpha = input_scale * weight_scale
-        # beta = bias_scale / output_scale
         # in case size mismatch
         int8_module.weight = torch.reshape(int8_weight, int8_module.weight.shape)
-        int8_module.bias = torch.reshape(module.bias, int8_module.bias.shape)
+        try:  # in case some linear layer does not have bias
+            int8_module.bias = torch.reshape(module.bias, int8_module.bias.shape)
+        except:
+            int8_module.bias = None
         int8_module.a = alpha
-        # int8_module.b = beta
         return int8_module
 
 
@@ -871,7 +1013,7 @@ class W8A8BFP16FP16Conv1D(torch.nn.Module):
         return self
 
     @torch.no_grad()
-    def forward(self, x, is_hybrid=False, has_offline=False, hack_sparsity=True):
+    def forward(self, x, is_hybrid=False, has_offline=False, hack_sparsity=False):
         x_shape = x.shape
         x = x.view(-1, x_shape[-1])
         t_weight = self.weight.t()

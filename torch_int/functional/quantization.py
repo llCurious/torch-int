@@ -3,6 +3,19 @@ import numpy as np
 
 
 @torch.no_grad()
+def quantize_per_tensor_absmax_custom_bits(t, bits=8, q_type=torch.int8):
+    segs = 2 ** (bits - 1) - 1
+    scale = t.abs().max() / segs
+    if not t.is_cuda:
+        # half rounding is not supported on CPU
+        t = t.float()
+    # use inplace operation to save memory
+    t.div_(scale).round_()
+    t_q = t.to(q_type)
+    return t_q, scale
+
+
+@torch.no_grad()
 def quantize_per_tensor_absmax(t):
     scale = t.abs().max() / 127
     if not t.is_cuda:
@@ -12,6 +25,7 @@ def quantize_per_tensor_absmax(t):
     t.div_(scale).round_()
     t_q = t.to(torch.int8)
     return t_q, scale
+
 
 @torch.no_grad()
 def quantize_weight_per_channel_absmax(w):
@@ -60,6 +74,7 @@ def dynamic_quantize_activation_per_token_absmax(t):
     q_act = t.to(torch.int8)
     return q_act, max_val
 
+
 @torch.no_grad()
 def fake_quantize_activation_per_tensor_absmax(t):
     max_val = t.abs().max()
@@ -85,6 +100,7 @@ def dequantize_activation_w_per_channel_a_per_token(q_act, w_scales, a_scales):
     q_act = q_act.to(torch.float32)
     q_act.mul_(w_scales.reshape(1, -1)).mul_(a_scales.reshape(-1, 1))
     return q_act.to(dtype)
+
 
 @torch.no_grad()
 def dequantize_activation_w_per_channel_a_per_tensor(q_act, w_scales, a_scales):
