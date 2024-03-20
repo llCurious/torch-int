@@ -19,5 +19,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "BMM (INT8 In Int32 Out) A x B.T");
 
   m.def("int8Matmul", &int8Matmul,
-        "MM (I8-OFP32)");
+        "MM (I8-O32)");
+  m.def("int32Matmul", &int32Matmul,
+        "MM (I32-O64)");
 }

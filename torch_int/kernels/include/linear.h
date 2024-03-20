@@ -44,4 +44,7 @@ torch::Tensor int8Matmul(torch::Tensor &A, // INT8
                          torch::Tensor &B  // INT8
 );
 
+torch::Tensor int32Matmul(torch::Tensor &A, // INT32
+                         torch::Tensor &B  // INT32
+);
 #endif // LINEAR_HS

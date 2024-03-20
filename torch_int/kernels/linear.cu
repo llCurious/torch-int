@@ -665,3 +665,46 @@ torch::Tensor int8Matmul(torch::Tensor &A, torch::Tensor &B) {
 
   return C;
 }
+
+// int32 * int32 = int64
+// NOTE: Tensor Core is not supported here.
+// from https://github.com/IST-DASLab/QUIK/blob/master/src/matmul/matmul.cu
+torch::Tensor int32Matmul(torch::Tensor &A, torch::Tensor &B) {
+  torch::checkAllSameGPU("int32Matmul", {{A, "A", 0}, {B, "B", 1}});
+  auto M = A.size(0);
+  auto N = B.size(0);
+  auto K = A.size(1);  // 4bit packing is on the columns
+  auto C = torch::empty({M, N}, torch::dtype(torch::kInt64).device(A.device()));
+
+  using Gemm = cutlass::gemm::device::Gemm<
+      int32_t,                          // ElementA
+      cutlass::layout::RowMajor,       // LayoutA
+      int32_t,                          // ElementB
+      cutlass::layout::ColumnMajor,    // LayoutB
+      int64_t,                         // ElementOutput
+      cutlass::layout::RowMajor,       // LayoutOutput
+      int64_t,                         // ElementAccumulator
+      cutlass::arch::OpClassSimt,  // tag indicating Tensor Cores
+      cutlass::arch::Sm80 // tag indicating target GPU compute architecture
+      >;
+
+  Gemm gemmOp;
+
+  using GemmCoord = cutlass::gemm::GemmCoord;
+
+  typename Gemm::Arguments arguments{
+      {static_cast<GemmCoord::Index>(M), static_cast<GemmCoord::Index>(N),
+       static_cast<GemmCoord::Index>(K)},
+      {A.data_ptr<int32_t>(), K},
+      {B.data_ptr<int32_t>(), K},
+      {C.data_ptr<int64_t>(), N},
+      {C.data_ptr<int64_t>(), N},
+      {1, 0}};
+
+  auto status = gemmOp(arguments);
+
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              cutlassGetStatusString(status))
+
+  return C;
+}
